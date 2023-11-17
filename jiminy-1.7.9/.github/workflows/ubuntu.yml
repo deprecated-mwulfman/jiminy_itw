@@ -1,0 +1,156 @@
+name: Ubuntu CI (Easy install dependencies)
+
+on:
+  # Trigger the workflow on push on the master branch, or for any pull request
+  push:
+    branches:
+      - master
+  pull_request:
+
+jobs:
+  build-test-and-deploy-doc-ubuntu:
+    name: >-
+      (${{ matrix.os }}) Easy install the dependencies. Build the project and run the unit tests.
+      Generate and deploy the documentation.
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-18.04
+            BUILD_TYPE: 'Debug'
+          - os: ubuntu-20.04
+            BUILD_TYPE: 'Release'
+
+    defaults:
+      run:
+        shell: bash -ieo pipefail {0}  # Using bash enables automatic sourcing `.bashrc` and fail-fast behavior
+
+    #####################################################################################
+
+    steps:
+    - name: Checkout branch
+      uses: actions/checkout@v2
+
+    #####################################################################################
+
+    - name: Setup minimal build environment
+      run: |
+        if [ ${{ matrix.os }} == "ubuntu-18.04" ] ; then
+          PYTHON_EXECUTABLE="/usr/bin/python3.6"
+        else
+          PYTHON_EXECUTABLE="/usr/bin/python3.8"
+        fi
+        echo "PYTHON_EXECUTABLE=${PYTHON_EXECUTABLE}" >> $GITHUB_ENV
+
+        echo "RootDir=${GITHUB_WORKSPACE}" >> $GITHUB_ENV
+        echo "InstallDir=${GITHUB_WORKSPACE}/install" >> $GITHUB_ENV
+
+        echo "/home/runner/.local/bin" >> $GITHUB_PATH
+    - name: Installing requirements
+      run: |
+        sudo env "PATH=$PATH" "${GITHUB_WORKSPACE}/build_tools/easy_install_deps_ubuntu.sh"
+        "${PYTHON_EXECUTABLE}" -m pip install tensorflow
+        "${PYTHON_EXECUTABLE}" -m pip install --upgrade "numpy<1.22"  # for numba compat.
+        "${PYTHON_EXECUTABLE}" -m pip install "torch==1.8.0+cpu" --trusted-host pypi.org \
+        --trusted-host pytorch.org --trusted-host download.pytorch.org --trusted-host files.pypi.org \
+        --trusted-host files.pytorch.org -f https://download.pytorch.org/whl/torch_stable.html
+        "${PYTHON_EXECUTABLE}" -m pip install --prefer-binary "gym>=0.18.3" "stable_baselines3>=0.10" "importlib-metadata>=3.3.0"
+
+    #####################################################################################
+
+    - name: PEP8 Code Style Check
+      if: matrix.os == 'ubuntu-20.04'
+      run: |
+        flake8 --ignore=E121,E126,E123,E226,E241,E266,E402,F405,W504 --count --show-source --statistics "$RootDir/python"
+
+    #####################################################################################
+
+    - name: Build and install Jiminy
+      run: |
+        mkdir "$RootDir/build" "$InstallDir"
+        cd "$RootDir/build"
+
+        cmake "$RootDir" -DCMAKE_INSTALL_PREFIX="$InstallDir" \
+              -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF \
+              -DBoost_NO_SYSTEM_PATHS=OFF -DPYTHON_EXECUTABLE="${PYTHON_EXECUTABLE}" \
+              -DBUILD_TESTING=ON -DBUILD_EXAMPLES=ON -DBUILD_PYTHON_INTERFACE=ON \
+              -DCMAKE_BUILD_TYPE="${{ matrix.BUILD_TYPE }}"
+        make install -j2
+
+    #####################################################################################
+
+    - name: Build extension module
+      run: |
+        "$InstallDir/bin/jiminy_double_pendulum"
+
+        mkdir -p "$RootDir/examples/cpp/pip_extension/build"
+        cd "$RootDir/examples/cpp/pip_extension/build"
+        cmake "$RootDir/examples/cpp/pip_extension" -DCMAKE_INSTALL_PREFIX="$InstallDir" \
+              -DPYTHON_EXECUTABLE="${PYTHON_EXECUTABLE}" -DCMAKE_BUILD_TYPE="${{ matrix.BUILD_TYPE }}"
+        make install
+
+        "$InstallDir/bin/pip_double_pendulum"
+
+    - name: Run jiminy unit tests
+      run: |
+        cd "$RootDir/build"
+        ctest
+
+        cd "$RootDir/unit_py"
+        "${PYTHON_EXECUTABLE}" -m unittest discover -v
+
+    - name: Run gym_jiminy unit tests
+      if: matrix.BUILD_TYPE == 'Release'
+      run: |
+        cd "$RootDir/python/gym_jiminy/unit_py"
+        "${PYTHON_EXECUTABLE}" -m unittest discover -v
+
+    #####################################################################################
+
+    - name: Python linter and static type checker
+      # Ubuntu 18 is distributed with Python3.6, which is not supported by Numpy>=1.20.
+      # The new type check support of Numpy is raising pylint and mypy errors, so Ubuntu 18
+      # is used to do type checking for now.
+      if: matrix.os == 'ubuntu-20.04'
+      run: |
+        gym_modules=(
+          "common"
+          "toolbox"
+          "rllib"
+        )
+        for name in "${gym_modules[@]}"; do
+          cd "$RootDir/python/gym_jiminy/$name"
+
+          pylint --unsafe-load-any-extension=y --ignore-imports=y --min-similarity-lines=20 --max-nested-blocks=7 \
+                 --good-names=i,j,k,t,q,v,x,e,u,s,v,b,c,f,M,dt,rg,fd,lo,hi,tb,_ \
+                 --disable=fixme,abstract-method,protected-access,useless-super-delegation \
+                 --disable=too-many-instance-attributes,too-many-arguments,too-few-public-methods,too-many-lines \
+                 --disable=too-many-locals,too-many-branches,too-many-statements \
+                 --disable=unspecified-encoding,logging-fstring-interpolation \
+                 --disable=misplaced-comparison-constant --disable=cyclic-import \
+                 --generated-members=numpy.*,torch.* "gym_jiminy/"
+
+          mypy --allow-redefinition --check-untyped-defs --disallow-incomplete-defs --disallow-untyped-defs \
+               --ignore-missing-imports --no-implicit-optional --strict-equality --strict-optional \
+               --warn-no-return --warn-redundant-casts --warn-unreachable --warn-unused-configs --warn-unused-ignores \
+               --pretty --show-error-codes --show-error-context --show-traceback \
+               --namespace-packages -p gym_jiminy
+        done
+
+    #####################################################################################
+
+    - name: Generate and install Doxygen documentation
+      run: |
+        cd build
+        cmake . -DCOMPONENT=docs -P ./cmake_install.cmake
+    - name: Deploy to GitHub Pages
+      if:  >-
+        matrix.os == 'ubuntu-20.04' && success() &&
+        github.repository == 'duburcqa/jiminy' && github.event_name == 'push' && github.ref == 'refs/heads/master'
+      uses: crazy-max/ghaction-github-pages@v2
+      with:
+        target_branch: gh-pages
+        build_dir: docs/html
+      env:
+        GITHUB_TOKEN: ${{ secrets.GH_DEPLOY }}

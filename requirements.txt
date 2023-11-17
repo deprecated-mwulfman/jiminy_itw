@@ -1,0 +1,5 @@
+jiminy-py[meshcat]==1.7.13
+matplotlib
+numpy
+control
+ipykernel==5.5.6

@@ -1,0 +1,173 @@
+name: MacOS CI (Build from source dependencies)
+
+on:
+  # Trigger the workflow on push on the master branch, or for any pull request
+  push:
+    branches:
+      - master
+  pull_request:
+
+jobs:
+  build-and-test-osx:
+    name: >-
+      (${{ matrix.os }}) (${{ matrix.PYTHON_VERSION }})
+      Build and run the unit tests. Then generate and publish the wheels on PyPi.
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      matrix:
+        include:
+          - os: macos-10.15
+            PYTHON_VERSION: '3.6'
+          - os: macos-10.15
+            PYTHON_VERSION: '3.7'
+          - os: macos-11
+            PYTHON_VERSION: '3.8'
+          - os: macos-11
+            PYTHON_VERSION: '3.9'
+
+    defaults:
+      run:
+        shell: bash -ieo pipefail {0}  # Using bash enables automatic sourcing `.bashrc` and fail-fast behavior
+
+    env:
+      BUILD_TYPE: "Release"
+      MACOSX_DEPLOYMENT_TARGET: "10.14"
+
+    #####################################################################################
+
+    steps:
+    - name: Checkout jiminy
+      uses: actions/checkout@v2
+
+    #####################################################################################
+
+    - name: Configure Python
+      uses: actions/setup-python@v2
+      with:
+        python-version: ${{ matrix.PYTHON_VERSION }}
+        architecture: 'x64'
+    - name: Setup minimal build environment
+      run: |
+        git config --global advice.detachedHead false
+
+        PYTHON_EXECUTABLE="${pythonLocation}/bin/python3"
+        echo "PYTHON_EXECUTABLE=${PYTHON_EXECUTABLE}" >> $GITHUB_ENV
+        echo "RootDir=${GITHUB_WORKSPACE}" >> $GITHUB_ENV
+        echo "InstallDir=${GITHUB_WORKSPACE}/install" >> $GITHUB_ENV
+
+        if [ "${{ matrix.os }}" == "macos-10.15" ] ; then
+          echo "OSX_ARCHITECTURES=x86_64" >> $GITHUB_ENV
+          echo "WHEEL_ARCH=x86_64" >> $GITHUB_ENV
+        else
+          echo "OSX_ARCHITECTURES=x86_64;arm64" >> $GITHUB_ENV
+          echo "WHEEL_ARCH=universal2" >> $GITHUB_ENV
+        fi
+
+        "${PYTHON_EXECUTABLE}" -m pip install --upgrade pip
+        "${PYTHON_EXECUTABLE}" -m pip install --upgrade twine wheel delocate
+        "${PYTHON_EXECUTABLE}" -m pip install --upgrade "numpy<1.22"  # for numba compat.
+    - name: Build project dependencies
+      run: |
+        MACOSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET} OSX_ARCHITECTURES=${OSX_ARCHITECTURES} \
+          ./build_tools/build_install_deps_unix.sh
+        "${PYTHON_EXECUTABLE}" -m pip install --prefer-binary "gym>=0.18.3" "stable_baselines3>=0.10" "importlib-metadata>=3.3.0"
+
+    #####################################################################################
+
+    - name: Build and install Jiminy
+      run: |
+        unset Boost_ROOT
+
+        # Build jiminy
+        mkdir "$RootDir/build"
+        cd "$RootDir/build"
+        export LD_LIBRARY_PATH="$InstallDir/lib/:/usr/local/lib"
+        cmake "$RootDir" -DCMAKE_INSTALL_PREFIX="$InstallDir" -DCMAKE_PREFIX_PATH="$InstallDir" \
+              -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF \
+              -DCMAKE_OSX_ARCHITECTURES="${OSX_ARCHITECTURES}" -DCMAKE_OSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET}" \
+              -DBOOST_ROOT="$InstallDir" -DBoost_INCLUDE_DIR="$InstallDir/include" \
+              -DBoost_NO_SYSTEM_PATHS=TRUE -DBoost_NO_BOOST_CMAKE=TRUE \
+              -DBoost_USE_STATIC_LIBS=ON -DPYTHON_EXECUTABLE="${PYTHON_EXECUTABLE}" \
+              -DBUILD_TESTING=ON -DBUILD_EXAMPLES=ON -DBUILD_PYTHON_INTERFACE=ON \
+              -DCMAKE_BUILD_TYPE="${BUILD_TYPE}"
+        make -j2
+
+        # Bundle the boost python dependencies with jiminy
+        mkdir -p "$RootDir/build/pypi/jiminy_py/src/jiminy_py"
+        cp -R -H "$InstallDir/lib/python${{ matrix.PYTHON_VERSION }}/site-packages/." \
+                 "$RootDir/build/pypi/jiminy_py/src/jiminy_py/core"
+
+        # Install jiminy along with its dependencies
+        make install
+
+        # Strip all symbol table and relocation information from python bindings and shared libraries
+        find "$RootDir/build/pypi/" -name "*.so" -print -exec strip -x {} +
+        find "$InstallDir/lib" -name "*.dylib" -maxdepth 1 -print -exec strip -x {} +
+
+    #####################################################################################
+
+    - name: Generate and install Python Pip wheels
+      run: |
+        export DYLD_LIBRARY_PATH="$InstallDir/lib"
+
+        cd "$RootDir/build"
+        cmake . -DCOMPONENT=pypi -P ./cmake_install.cmake
+
+        delocate-wheel --require-archs "${WHEEL_ARCH}" \
+                       -w "$RootDir/build/wheelhouse" "$RootDir/build/pypi/dist/jiminy_py/"*.whl
+        delocate-addplat --rm-orig --clobber -p "macosx_${MACOSX_DEPLOYMENT_TARGET//./_}_${WHEEL_ARCH}" \
+                         "$RootDir/build/wheelhouse/"*.whl
+        "${PYTHON_EXECUTABLE}" -m pip install --force-reinstall --no-deps "$RootDir/build/wheelhouse/"*.whl
+    - name: Upload the wheel for Linux of jiminy_py
+      if: success() && github.repository == 'duburcqa/jiminy'
+      uses: actions/upload-artifact@v1
+      with:
+        name: jiminy_py-${{ matrix.os }}-${{ matrix.PYTHON_VERSION }}-wheel
+        path: build/wheelhouse
+
+    #####################################################################################
+
+    - name: Run unit tests
+      run: |
+        cd "$RootDir/build"
+        ctest
+
+        cd "$RootDir/unit_py"
+        "${PYTHON_EXECUTABLE}" -m unittest discover -v
+
+        cd "$RootDir/python/gym_jiminy/unit_py"
+        "${PYTHON_EXECUTABLE}" -m unittest discover -v
+
+#########################################################################################
+
+  publish-pypi-macos:
+    name: (MacOS CI) Publish on PyPi the wheel for OS X of jiminy_py
+    needs: build-and-test-osx
+    runs-on: ubuntu-20.04
+    if: github.repository == 'duburcqa/jiminy' && github.event_name == 'push' && github.ref == 'refs/heads/master'
+
+    strategy:
+      matrix:
+        include:
+          - os: macos-10.15
+            PYTHON_VERSION: '3.6'
+          - os: macos-10.15
+            PYTHON_VERSION: '3.7'
+          - os: macos-11
+            PYTHON_VERSION: '3.8'
+          - os: macos-11
+            PYTHON_VERSION: '3.9'
+
+    steps:
+    - name: Download the wheel previously generated
+      uses: actions/download-artifact@v1
+      with:
+        name: jiminy_py-${{ matrix.os }}-${{ matrix.PYTHON_VERSION }}-wheel
+        path: wheelhouse
+    - name: Publish the wheel
+      uses: pypa/gh-action-pypi-publish@master
+      with:
+        user: __token__
+        password: ${{ secrets.PYPI_DEPLOY }}
+        packages_dir: wheelhouse

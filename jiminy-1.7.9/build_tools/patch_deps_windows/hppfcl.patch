@@ -1,0 +1,162 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index d675c2c..c503cf1 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -70,38 +70,31 @@ COMPUTE_PROJECT_ARGS(PROJECT_ARGS LANGUAGES CXX)
+ PROJECT(${PROJECT_NAME} ${PROJECT_ARGS})
+ 
+ ADD_PROJECT_DEPENDENCY(Eigen3 REQUIRED PKG_CONFIG_REQUIRES "eigen3 >= 3.0.0")
++ADD_PROJECT_DEPENDENCY(zlib REQUIRED "zlib" NO_MODULE)
++ADD_PROJECT_DEPENDENCY(IrrXML REQUIRED "IrrXML" NO_MODULE)
++ADD_PROJECT_DEPENDENCY(assimp REQUIRED "assimp >= 5.0.0" NO_MODULE)
+ 
+ if(BUILD_PYTHON_INTERFACE)
+   FIND_PACKAGE(eigenpy 2.2 REQUIRED)
+ endif()
+ 
+ # Required dependencies
+ SET_BOOST_DEFAULT_OPTIONS()
+ EXPORT_BOOST_DEFAULT_OPTIONS()
+-IF(WIN32)
+-  ADD_PROJECT_DEPENDENCY(Boost REQUIRED COMPONENTS chrono thread date_time serialization)
+-ELSE(WIN32)
+-  ADD_PROJECT_DEPENDENCY(Boost REQUIRED chrono serialization)
+-ENDIF(WIN32)
+ if(BUILD_PYTHON_INTERFACE)
+   FINDPYTHON()
+   search_for_boost_python(REQUIRED)
+   find_package(Boost REQUIRED COMPONENTS system)
+ endif(BUILD_PYTHON_INTERFACE)
++IF(WIN32)
++  ADD_PROJECT_DEPENDENCY(Boost REQUIRED COMPONENTS chrono thread date_time serialization)
++ELSE(WIN32)
++  ADD_PROJECT_DEPENDENCY(Boost REQUIRED chrono serialization)
++ENDIF(WIN32)
+ 
+ # Optional dependencies
+-ADD_PROJECT_DEPENDENCY(octomap PKG_CONFIG_REQUIRES "octomap >= 1.6")
+-if(octomap_FOUND)
+-  SET(HPP_FCL_HAS_OCTOMAP TRUE)
+-  string(REPLACE "." ";" VERSION_LIST ${octomap_VERSION})
+-  list(GET VERSION_LIST 0 OCTOMAP_MAJOR_VERSION)
+-  list(GET VERSION_LIST 1 OCTOMAP_MINOR_VERSION)
+-  list(GET VERSION_LIST 2 OCTOMAP_PATCH_VERSION)
+-  message(STATUS "FCL uses Octomap")
+-else()
+-  SET(HPP_FCL_HAS_OCTOMAP FALSE)
+-  message(STATUS "FCL does not use Octomap")
+-endif()
++SET(HPP_FCL_HAS_OCTOMAP FALSE)
++message(STATUS "FCL does not use Octomap")
+ 
+ option(HPP_FCL_HAS_QHULL "use qhull library to compute convex hulls." FALSE)
+ if(HPP_FCL_HAS_QHULL)
+@@ -119,7 +112,7 @@ if(HPP_FCL_HAS_QHULL)
+     PATHS ${Qhull_PREFIX}
+     )
+   find_library(Qhull_r_LIBRARY
+-    NAMES libqhull_r.so
++    NAMES qhullstatic_r.lib
+     PATHS ${Qhull_PREFIX}
+     )
+ endif()
+@@ -188,12 +181,10 @@ SET(${PROJECT_NAME}_HEADERS
+   include/hpp/fcl/timings.h
+   )
+
+-add_subdirectory(doc)
+ add_subdirectory(src)
+ if (BUILD_PYTHON_INTERFACE)
+   add_subdirectory(python)
+ endif ()
+-add_subdirectory(test)
+
+ pkg_config_append_libs("hpp-fcl")
+ IF(HPP_FCL_HAS_OCTOMAP)
+diff --git a/cmake/boost.cmake b/cmake/boost.cmake
+index bea38e4..3dcfbf6 100644
+--- a/cmake/boost.cmake
++++ b/cmake/boost.cmake
+@@ -102,7 +102,15 @@ MACRO(SEARCH_FOR_BOOST_PYTHON)
+     MESSAGE(WARNING "Impossible to check Boost.Python version. Trying with 'python'.")
+   ENDIF(NOT BOOST_PYTHON_FOUND)
+
++  set(Boost_USE_STATIC_LIBS OFF)
++  set(Boost_LIB_PREFIX "")
++  unset(Boost_LIBRARIES)
+   FIND_PACKAGE(Boost ${BOOST_PYTHON_REQUIRED} COMPONENTS ${BOOST_PYTHON_NAME})
++  unset(Boost_LIBRARIES)
++  if(WIN32)
++    set(Boost_LIB_PREFIX "lib")
++  endif()
++  set(Boost_USE_STATIC_LIBS ON)
+   STRING(TOUPPER ${BOOST_PYTHON_NAME} UPPERCOMPONENT)
+
+   LIST(APPEND LOGGING_WATCHED_VARIABLES
+@@ -151,7 +159,6 @@ MACRO(SEARCH_FOR_BOOST)
+   FIND_PACKAGE(Boost ${BOOST_REQUIRED})
+   STRING(REPLACE "_" "." Boost_SHORT_VERSION ${Boost_LIB_VERSION})
+   IF("${Boost_SHORT_VERSION}" VERSION_GREATER "1.70" OR "${Boost_SHORT_VERSION}" VERSION_EQUAL "1.70")
+-    SET(BUILD_SHARED_LIBS ON)
+     SET(Boost_NO_BOOST_CMAKE ON)
+   ENDIF("${Boost_SHORT_VERSION}" VERSION_GREATER "1.70" OR "${Boost_SHORT_VERSION}" VERSION_EQUAL "1.70")
+ 
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 043d18b..dcc79be 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -152,7 +152,6 @@ FOREACH(header ${${PROJECT_NAME}_HEADERS})
+ ENDFOREACH()
+ LIST(APPEND PROJECT_HEADERS_FULL_PATH ${PROJECT_BINARY_DIR}/include/hpp/fcl/config.hh)
+ add_library(${LIBRARY_NAME}
+-  SHARED
+   ${PROJECT_HEADERS_FULL_PATH}
+   ${${LIBRARY_NAME}_SOURCES}
+   )
+@@ -161,6 +160,9 @@ add_library(${LIBRARY_NAME}
+ ADD_SOURCE_GROUP(${LIBRARY_NAME}_SOURCES)
+ ADD_HEADER_GROUP(PROJECT_HEADERS_FULL_PATH)
+
++find_package(zlib NO_MODULE)
++find_package(IrrXML NO_MODULE)
++find_package(assimp NO_MODULE)
+ TARGET_INCLUDE_DIRECTORIES(${LIBRARY_NAME}
+   SYSTEM PUBLIC
+   ${Boost_INCLUDE_DIRS}
+@@ -168,8 +170,7 @@ TARGET_INCLUDE_DIRECTORIES(${LIBRARY_NAME}
+
+ TARGET_LINK_LIBRARIES(${LIBRARY_NAME}
+   PRIVATE
+-  ${assimp_LIBRARIES}
+-  # assimp::assimp # Not working
++  Boost::boost assimp::assimp IrrXML::IrrXML zlib::zlib
+   )
+
+ TARGET_LINK_LIBRARIES(${LIBRARY_NAME}
+diff --git a/cmake/deprecated.hh.cmake b/cmake/deprecated.hh.cmake
+index 0726e3e..8fd0928 100644
+--- a/cmake/deprecated.hh.cmake
++++ b/cmake/deprecated.hh.cmake
+@@ -26,7 +26,7 @@
+ #  define @PACKAGE_CPPNAME@_DEPRECATED __attribute__ ((deprecated))
+ # else
+ #  if defined(_MSC_VER) && !defined(__INTEL_COMPILER)
+-#   define @PACKAGE_CPPNAME@_DEPRECATED __declspec (deprecated)
++#   define @PACKAGE_CPPNAME@_DEPRECATED /* nothing */
+ #  else
+ // If the compiler is not recognized, drop the feature.
+ #   define @PACKAGE_CPPNAME@_DEPRECATED /* nothing */
+diff --git a/third-parties/qhull/CMakeLists.txt b/third-parties/qhull/CMakeLists.txt
+index 59dff41..2765817 100644
+--- a/third-parties/qhull/CMakeLists.txt
++++ b/third-parties/qhull/CMakeLists.txt
+@@ -624,3 +624,9 @@ install(FILES html/qhull.man         DESTINATION ${MAN_INSTALL_DIR} RENAME qhull
+ install(FILES html/rbox.man          DESTINATION ${MAN_INSTALL_DIR} RENAME rbox.1)
+ install(FILES ${doc_FILES}           DESTINATION ${DOC_INSTALL_DIR})
+ install(DIRECTORY html/              DESTINATION ${DOC_INSTALL_DIR})
++
++add_compile_options(
++    $<$<CONFIG:>:/MD> #---------|
++    $<$<CONFIG:Debug>:/MDd> #---|-- Statically link the runtime libraries
++    $<$<CONFIG:Release>:/MD> #--|
++)

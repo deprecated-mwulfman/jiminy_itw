@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html>
+	<head>
+		<meta charset=utf-8>
+		<title>MeshCat</title>
+		<link rel="icon" href="data:;base64,iVBORw0KGgo=">
+	</head>
+	<body>
+        <div id="widgets"></div>
+        <div id="meshcat-pane"></div>
+
+        <script type="text/javascript" src="main.min.js"></script>
+        <script type="text/javascript" src="html2canvas.min.js"></script>
+        <script type="text/javascript" src="webm-writer-0.3.0.js"></script>
+        <script type="text/javascript" src="widgets.js"></script>
+        <script>
+            // Instantiate a new Meshcat viewer
+            var viewer = new MeshCat.Viewer(document.getElementById("meshcat-pane"), false);
+
+            // Monkey-patch 'set_object_from_json' and 'handle_command'
+            // to add support of custom 'ready' command, which is used to
+            // determine  if all the meshes have finish loading. Indeed,
+            // commands are only processed once every meshes are loaded.
+            var handle_command = viewer.handle_command;
+            viewer.handle_command = function(cmd) {
+                if (cmd.type == "ready") {
+                    viewer.connection.send("meshcat:ok");
+                } else if (cmd.type == "legend") {
+                    updateLegend(cmd);
+                } else if (cmd.type == "watermark") {
+                    updateWatermark(cmd);
+                } else {
+                    handle_command.call(this, cmd);
+                }
+            };
+
+            // Connect the viewer to the existing server, though direct ZMP
+            // websocket in standalone browser or though kernel communication
+            // in notebooks.
+            try {
+                // Set externally by python in interactive mode
+                var ws_path = undefined;
+
+                if (typeof google !== 'undefined') {
+                    (async () => {
+                        viewer.connection = await google.colab.kernel.comms.open("meshcat", "meshcat:open");
+                        console.log("connection to Google Colab kernel:", viewer.connection);
+
+                        (async function() {
+                            for await (const message of viewer.connection.messages) {
+                                viewer.handle_command_bytearray(new Uint8Array(message.buffers[0]));
+                            }
+                            console.log("connection to Google Colab kernel closed.");
+                        })();
+                    })();
+                }
+                else if (typeof window.parent.Jupyter !== 'undefined') {
+                    viewer.connection = window.parent.Jupyter.notebook.kernel.comm_manager.new_comm("meshcat", "meshcat:open");
+                    console.log("connection to Jupyter kernel:", viewer.connection);
+                    viewer.connection.on_msg(function(message) {
+                        viewer.handle_command_bytearray(new Uint8Array(message.buffers[0].buffer));
+                    });
+                    viewer.connection.on_close(function(message) {
+                        console.log("connection to Jupyter kernel closed:", message);
+                        viewer.connection = null;  // The connection is no longer available
+                    });
+                }
+                else if (ws_path !== undefined) {
+                    // Connect to kernel socket manually if necessary, namely for
+                    // VSCode notebooks and jupyterlab.
+                    const ws_url = "ws" + window.parent.location.origin.substring(4) + ws_path;
+                    viewer.connection = new window.WebSocket(ws_url);
+
+                    // Define UUID generation utility to identify the comm and messages
+                    function uuid() {
+                        return ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g, c =>
+                            (c ^ crypto.getRandomValues(new Uint8Array(1))[0] & 15 >> c / 4).toString(16)
+                        );
+                    };
+
+                    // Define message deserialization method
+                    var deserialize_array_buffer = function (buf) {
+                        var data = new DataView(buf);
+                        var nbufs = data.getUint32(0);
+                        var offsets = [];
+                        var i;
+                        for (i = 1; i <= nbufs; i++) {
+                            offsets.push(data.getUint32(i * 4));
+                        }
+                        var json_bytes = new Uint8Array(buf.slice(offsets[0], offsets[1]));
+                        var msg = JSON.parse(
+                            (new TextDecoder('utf8')).decode(json_bytes)
+                        );
+                        msg.buffers = [];
+                        var start, stop;
+                        for (i = 1; i < nbufs; i++) {
+                            start = offsets[i];
+                            stop = offsets[i+1] || buf.byteLength;
+                            msg.buffers.push(new DataView(buf.slice(start, stop)));
+                        }
+                        return msg;
+                    };
+
+                    // Create unique comm identifier
+                    const comm_id = uuid();
+
+                    // Monkey-patch send command
+                    var send = viewer.connection.send;
+                    viewer.connection.send = function(data, msg_type) {
+                        var msg = {
+                            header : {
+                                date: new Date().toISOString(),
+                                username : "meshcat",
+                                msg_id : uuid(),
+                                session : "000000000000",
+                                version : "5.3",
+                                msg_type : msg_type || "comm_msg"
+                            },
+                            metadata : {},
+                            content : {
+                                comm_id : comm_id,
+                                target_name : "meshcat",
+                                data : data,
+                            },
+                            channel : 'shell',
+                            buffers : [],
+                            parent_header : {}
+                        };
+                        send.call(this, JSON.stringify(msg));
+                    };
+
+                    // Monkey-patch close command
+                    var close = viewer.connection.close;
+                    viewer.connection.close = function() {
+                        // For some reason, `onclose` is never called, and
+                        // calling the original `close` interferes with the
+                        // send method and the message is never received.
+                        viewer.connection.send("meshcat:close", "comm_close");
+                    };
+
+                    // Define event handler
+                    viewer.connection.onopen = function(event) {
+                        console.log("connection to generic ipykernel:", viewer.connection);
+                        viewer.connection.send("meshcat:open", "comm_open");
+                    };
+                    viewer.connection.onmessage = async function (event) {
+                        var data = event.data;
+                        if (data instanceof Blob) {
+                            const reader = new FileReader();
+                            reader.addEventListener('loadend', () => {
+                                var p = Promise.resolve(deserialize_array_buffer(reader.result));
+                                p.then(function(msg) {
+                                    if (msg.content.comm_id === comm_id)
+                                    {
+                                        viewer.handle_command_bytearray(new Uint8Array(msg.buffers[0].buffer));
+                                    }
+                                });
+                            });
+                            reader.readAsArrayBuffer(event.data);
+                        }
+                    };
+                    viewer.connection.onclose = function (message) {
+                        console.log("connection to generic ipykernel closed:", message);
+                        viewer.connection = null;  // The connection is no longer available
+                    };
+                }
+                else
+                {
+                    // Fallback to direct local communication through meshcat ZMQ socket
+                    viewer.connect();
+                }
+            } catch (e) {
+                console.info("not connected to MeshCat server: ", e);
+            }
+
+            // Replace the mesh grid by tiles. The paving size is 1m by 1m.
+            var segments = 20;
+            var cmap = [new MeshCat.THREE.Color(0x222233), new MeshCat.THREE.Color(0xf2f2fe)];
+            var geometry = new MeshCat.THREE.PlaneBufferGeometry(
+                segments, segments, segments, segments).toNonIndexed();
+            var material = new MeshCat.THREE.MeshBasicMaterial(
+                {vertexColors: true, side: MeshCat.THREE.DoubleSide});
+            var colors = [];
+            for (var x of [...Array(segments).keys()]) {
+                for (var y of [...Array(segments).keys()]) {
+                    var color = cmap[(x + y) % 2];
+                    colors.push(color.r, color.g, color.b);
+                    colors.push(color.r, color.g, color.b);
+                    colors.push(color.r, color.g, color.b);
+                    colors.push(color.r, color.g, color.b);
+                    colors.push(color.r, color.g, color.b);
+                    colors.push(color.r, color.g, color.b);
+                }
+            }
+            geometry.setAttribute('color', new MeshCat.THREE.Float32BufferAttribute(colors, 3));
+            var checkerboard = new MeshCat.THREE.Mesh(geometry, material);
+            viewer.scene_tree.find(["Grid"]).set_object(checkerboard)
+
+            viewer.scene_tree.find(["Axes", "<object>"]).object.material.linewidth = 2.5
+
+            // Update the "zoom" of the camera and its default position
+            viewer.camera.fov = 30;
+            viewer.camera.position.set(8.0, 1.2, 0);
+            viewer.render();
+
+            // Fix 'capture_image' and 'animate' methods to NOT
+            // automatically update controls, which would prevent free
+            // control of the camera programmatically. Note that it does
+            // not disable controls update while moving the camera using
+            // the mouse, which is nice because it enforces the camera
+            // to be "straight".
+            viewer.capture_image = async function() {
+                var snapshot_canvas = await captureFrameAndWidgets(viewer);
+                return snapshot_canvas.toDataURL('image/png');  // Export to webp is about 70% slower than png.
+            };
+            function animate() {
+                if (continue_animating) {
+                    requestAnimationFrame(animate);
+                }
+                viewer.animator.update();
+                if (viewer.needs_render) {
+                    viewer.camera.updateProjectionMatrix();
+                    viewer.renderer.render(viewer.scene, viewer.camera);
+                    viewer.animator.after_render();
+                    viewer.needs_render = false;
+                }
+            }
+
+            // Enable start and stop animation on-the-fly
+            var continue_animating = true;
+            function start_animate() {
+                continue_animating = true;
+                animate()
+            }
+            function stop_animate() {
+                continue_animating = false;
+            }
+            start_animate();
+
+            window.onunload = function(event) {
+                // Only close the connection if it is still open.
+                // Note that it is still possible that "on_close" method has
+                // not been triggered and that the connection is no longer
+                // available.
+                if (viewer.connection !== null)
+                {
+                    console.log("closing connection...");
+                    viewer.connection.close();
+                }
+                return false;
+            }
+        </script>
+
+        <style>
+            body {
+                margin: 0;
+            }
+
+            #meshcat-pane {
+                width: 100vw;
+                height: 100vh;
+                overflow: hidden;
+            }
+
+            #widgets {
+                width: 100vw;
+                height: 100vh;
+                position: absolute;
+                pointer-events: none;
+                overflow: hidden;
+            }
+        </style>
+        <script id="embedded-json"></script>
+	</body>
+</html>

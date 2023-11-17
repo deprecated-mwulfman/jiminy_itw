@@ -20,6 +20,14 @@ frictionDrySlope = -0.0
 
 [Sensor.EncoderSensor.PendulumJoint]
 joint_name = "PendulumJoint"
+bias = [0.1]
+delay = 0.020
+delayInterpolationOrder = 0
+noiseStd = [0.3]
 
 [Sensor.EncoderSensor.SecondPendulumJoint]
 joint_name = "SecondPendulumJoint"
+bias = [0.1]
+delay = 0.01
+delayInterpolationOrder = 0
+noiseStd = [0.2]
